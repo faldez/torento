@@ -1,10 +1,10 @@
 extern crate pretty_env_logger;
 #[macro_use]
 extern crate log;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use futures::future::join_all;
 use rand::{distributions::Alphanumeric, Rng};
 use tokio::{fs::File, io::AsyncReadExt, task::JoinHandle};
-use futures::future::join_all;
 
 mod metainfo;
 mod peer;
@@ -19,8 +19,14 @@ async fn main() -> Result<()> {
     pretty_env_logger::init();
 
     let mut buffer = vec![];
-    let mut file = File::open("C:\\Users\\fadhlika\\Downloads\\Bottom-Tier Character Tomozaki [Yen Press] [LuCaZ].torrent").await.unwrap();
-    file.read_to_end(&mut buffer).await;
+    let mut file = File::open(
+        "/Users/fadhlika/Downloads/Bottom-Tier Character Tomozaki [Yen Press] [LuCaZ].torrent",
+    )
+    .await
+    .unwrap();
+    if let Err(e) = file.read_to_end(&mut buffer).await {
+        return Err(anyhow!(e));
+    }
 
     let torrent = Metainfo::from_bytes(&buffer);
 
@@ -32,12 +38,10 @@ async fn main() -> Result<()> {
 
     let left = if let Some(left) = torrent.info.length {
         left
+    } else if let Some(files) = torrent.info.files {
+        files.iter().fold(0, |acc, file| acc + file.length)
     } else {
-        if let Some(files) = torrent.info.files {
-            files.iter().fold(0, |acc, file| acc + file.length)
-        } else {
-            0
-        }
+        0
     };
 
     let peer_id: String = rand::thread_rng()
@@ -61,7 +65,7 @@ async fn main() -> Result<()> {
     let mut handles: Vec<JoinHandle<()>> = vec![];
     for peer in resp.peers.iter() {
         let p = peer.clone();
-        let id= peer_id.clone();
+        let id = peer_id.clone();
         let info_hash = torrent.info_hash.clone();
 
         handles.push(tokio::spawn(async move {
@@ -71,18 +75,18 @@ async fn main() -> Result<()> {
                     return;
                 }
             };
-    
+
             if session.handshake(&info_hash).await.is_err() {
                 return;
             }
 
             match session.send_message(peer::Message::Interested).await {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(_) => {
                     return;
                 }
             };
-    
+
             loop {
                 let msg = match session.read_message().await {
                     Ok(msg) => msg,
@@ -90,12 +94,12 @@ async fn main() -> Result<()> {
                         return;
                     }
                 };
-                
+
                 info!("{:?}", msg);
             }
         }));
     }
-    
+
     join_all(handles).await;
 
     Ok(())

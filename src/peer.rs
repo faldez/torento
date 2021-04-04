@@ -3,13 +3,11 @@ use serde::{
     de::{Error, SeqAccess, Visitor},
     Deserializer,
 };
-use serde_bytes::ByteBuf;
-use std::{
-    convert::TryInto,
-    io::{Read, Write},
-    net::{IpAddr, Ipv4Addr},
+use std::{borrow::BorrowMut, convert::TryInto, mem::size_of, net::{IpAddr, Ipv4Addr}};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
 };
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream};
 
 #[derive(Debug)]
 pub enum Message {
@@ -17,19 +15,19 @@ pub enum Message {
     Unchoke,
     Interested,
     NotInterested,
-    Have(u8),
-    Bitfield(u16),
-    Request(u8, i64, i64),
-    Piece(u8, i64, ByteBuf),
-    Cancel(u8, i64, i64),
+    Have(u32),
+    Bitfield(Vec<u8>),
+    Request(u32, u32, u32),
+    Piece(u32, u32, Vec<u8>),
+    Cancel(u32, u32, u32),
     KeepAlive,
-    Invalid
+    Invalid,
 }
 
 impl From<Vec<u8>> for Message {
     fn from(bytes: Vec<u8>) -> Self {
         if bytes.len() == 0 {
-            return  Message::KeepAlive;
+            return Message::KeepAlive;
         }
 
         match bytes[0] {
@@ -37,11 +35,54 @@ impl From<Vec<u8>> for Message {
             1 => Message::Unchoke,
             2 => Message::Interested,
             3 => Message::NotInterested,
-            4 => Message::Have(bytes[1]),
-            5 => Message::Bitfield(0),
-            6 => Message::Request(0, 0, 0),
-            7 => Message::Piece(0, 0, ByteBuf::new()),
-            8 => Message::Cancel(0, 0, 0),
+            4 => {
+                let mut payload: [u8; 4] = [0; 4];
+                payload.copy_from_slice(&bytes[1..]);
+                let index = u32::from_be_bytes(payload);
+                Message::Have(index)
+            },
+            5 => {
+                let payload = bytes[1..].to_vec();
+                Message::Bitfield(payload)
+            }
+            6 => {
+                let mut payload: [u8; 4] = [0; 4];
+                payload.copy_from_slice(&bytes[1..5]);
+                let index = u32::from_be_bytes(payload);
+
+                payload.copy_from_slice(&bytes[5..9]);
+                let begin = u32::from_be_bytes(payload);
+
+                payload.copy_from_slice(&bytes[9..13]);
+                let length = u32::from_be_bytes(payload);
+
+                Message::Request(index, begin, length)
+            },
+            7 => {
+                let mut payload: [u8; 4] = [0; 4];
+                payload.copy_from_slice(&bytes[1..5]);
+                let index = u32::from_be_bytes(payload);
+
+                payload.copy_from_slice(&bytes[5..9]);
+                let begin = u32::from_be_bytes(payload);
+
+                let piece = bytes[9..].to_vec();
+                
+                Message::Piece(index, begin, piece)
+            },
+            8 => {
+                let mut payload: [u8; 4] = [0; 4];
+                payload.copy_from_slice(&bytes[1..5]);
+                let index = u32::from_be_bytes(payload);
+
+                payload.copy_from_slice(&bytes[5..9]);
+                let begin = u32::from_be_bytes(payload);
+
+                payload.copy_from_slice(&bytes[9..13]);
+                let length = u32::from_be_bytes(payload);
+
+                Message::Cancel(index, begin, length)
+            },
             _ => Message::Invalid,
         }
     }
@@ -49,41 +90,50 @@ impl From<Vec<u8>> for Message {
 
 impl Into<Vec<u8>> for Message {
     fn into(self) -> Vec<u8> {
+        let mut message = vec![];
         match self {
             Message::Choke => {
-                return vec![0];
+                message.push(0);
             }
             Message::Unchoke => {
-                return vec![1];
+                message.push(1);
             }
             Message::Interested => {
-                return  vec![2];
+                message.push(2);
             }
             Message::NotInterested => {
-                return  vec![3];
+                message.push(3);
             }
             Message::Have(index) => {
-                return  vec![4, index as u8];
+                message.push(4);
+                message.extend(&index.to_be_bytes());
             }
-            Message::Bitfield(_) => {
-                return  vec![5];
+            Message::Bitfield(index) => {
+                message.push(5);
+                message.extend(&index);
             }
             Message::Request(index, begin, length) => {
-                return  vec![6, index, begin as u8, length as u8];
+                message.push(6);
+                message.extend(&index.to_be_bytes());
+                message.extend(&begin.to_be_bytes());
+                message.extend(&length.to_be_bytes());
             }
-            Message::Piece(index, begin, _piece) => {
-                return  vec![7, index, begin as u8];
+            Message::Piece(index, begin, piece) => {
+                message.push(7);
+                message.extend(&index.to_be_bytes());
+                message.extend(&begin.to_be_bytes());
+                message.extend(&piece);
             }
             Message::Cancel(index, begin, length) => {
-                return  vec![8, index, begin as u8, length as u8];
+                message.push(8);
+                message.append(&mut index.to_be_bytes().to_vec());
+                message.append(&mut begin.to_be_bytes().to_vec());
+                message.append(&mut length.to_be_bytes().to_vec());
             }
-            Message::KeepAlive => {
-                return  vec![];
-            }
-            Message::Invalid => {
-                return  vec![];
-            }
+            Message::KeepAlive => {}
+            Message::Invalid => {}
         }
+        return message;
     }
 }
 
@@ -169,7 +219,7 @@ impl Session {
     }
 
     pub async fn handshake(&mut self, info_hash: &[u8]) -> Result<(), anyhow::Error> {
-        let mut buf = ByteBuf::new();
+        let mut buf = vec![];
         buf.extend_from_slice(&[19; 1]);
         buf.extend_from_slice(b"BitTorrent protocol");
         buf.extend_from_slice(&[0; 8]);
@@ -206,20 +256,22 @@ impl Session {
     }
 
     pub async fn read_message(&mut self) -> Result<Message> {
-        let mut len = [0; 1];
-        match self.conn.read_exact(&mut len).await {
-            Ok(_) => {},
+        let mut len_prefix = [0; 4];
+        match self.conn.read_exact(&mut len_prefix).await {
+            Ok(_) => {}
             Err(e) => {
                 error!("failed to read message {}", e);
                 return Err(anyhow::anyhow!(e));
             }
         }
 
-        info!("len: {}", len[0]);
+        let length = u32::from_be_bytes(len_prefix);
 
-        let mut message = vec![0; len[0] as usize];
+        info!("len: {}", length);
+
+        let mut message = vec![0; length as usize];
         match self.conn.read_exact(&mut message).await {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => {
                 error!("failed to read message {}", e);
                 return Err(anyhow::anyhow!(e));
@@ -233,13 +285,12 @@ impl Session {
         let payload: Vec<u8> = message_type.into();
         info!("send message {:?}", payload);
         match self.conn.write_all(&payload).await {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => {
                 error!("failed to send message {}", e);
                 return Err(anyhow::anyhow!(e));
             }
         }
-
 
         Ok(())
     }
