@@ -39,33 +39,14 @@ pub struct Response {
 #[derive(Debug)]
 pub enum Error {
     QueryError(String),
-    HTTPError(String),
+    HTTPError(reqwest::Error),
     BencodeError(serde_bencode::Error),
     URLEncodeError(serde_urlencoded::ser::Error),
 }
 
-impl From<ureq::Error> for Error {
-    fn from(e: ureq::Error) -> Self {
-        match e {
-            ureq::Error::Status(_code, res) => {
-                let mut buf = vec![];
-                let reader = res.into_reader();
-                for byte in reader.bytes() {
-                    buf.push(byte.unwrap())
-                }
-
-                match serde_bencode::from_bytes::<Response>(&buf).map_err(|e| Error::BencodeError(e)) {
-                    Ok(parsed) => {
-                        Error::QueryError(parsed.failure_reason.unwrap())
-                    }
-                    Err(e) => {
-                        e
-                    }
-                }
-                
-            }
-            ureq::Error::Transport(t) => Error::HTTPError(t.to_string()),
-        }
+impl From<reqwest::Error> for Error {
+    fn from(e: reqwest::Error) -> Self {
+        return Error::HTTPError(e);
     }
 }
 
@@ -87,18 +68,21 @@ const FRAGMENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'_')
     .remove(b'.');
 
-pub fn announce(url: String, param: Params) -> Result<Response, Error> {
+pub async fn announce(url: String, param: Params) -> Result<Response, Error> {
     let query = serde_urlencoded::to_string(&param)?;
     let res = percent_encode(&param.info_hash, FRAGMENT);
     let tracker_url = format!("{}?info_hash={}&{}", url, res.to_string(), query);
 
-    let result = ureq::get(&tracker_url).timeout(Duration::new(120, 0)).call()?;
+    let response = reqwest::get(&tracker_url).await?.bytes().await.map_err(|e| Error::HTTPError(e))?;
 
-    let mut buf = vec![];
-    let reader = result.into_reader();
-    for byte in reader.bytes() {
-        buf.push(byte.unwrap())
+    match serde_bencode::from_bytes::<Response>(&response) {
+        Ok(res) => {
+            if let Some(failure_reason) = res.failure_reason {
+                Err(Error::QueryError(failure_reason))
+            } else {
+                Ok(res)
+            }
+        }
+        Err(e) => Err(Error::BencodeError(e))
     }
-
-    serde_bencode::from_bytes::<Response>(&buf).map_err(|e| Error::BencodeError(e))
 }

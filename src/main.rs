@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
         event: None,
         compact: 1,
     };
-    let resp = announce(torrent.announce, announce_param).unwrap();
+    let resp = announce(torrent.announce, announce_param).await.unwrap();
 
     let mut handles: Vec<JoinHandle<()>> = vec![];
     for peer in resp.peers.iter() {
