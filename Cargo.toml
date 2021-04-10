@@ -1,5 +1,5 @@
 [package]
-name = "torrent"
+name = "torento"
 version = "0.1.0"
 authors = ["Muhammad Fadhlika <fadhlika@gmail.com>"]
 edition = "2018"

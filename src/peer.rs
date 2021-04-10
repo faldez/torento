@@ -3,11 +3,13 @@ use serde::{
     de::{Error, SeqAccess, Visitor},
     Deserializer,
 };
-use std::{borrow::BorrowMut, convert::TryInto, mem::size_of, net::{IpAddr, Ipv4Addr}};
+use std::{borrow::BorrowMut, convert::TryInto, mem::size_of, net::{IpAddr, Ipv4Addr, SocketAddr}, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
+
+use crate::torrent::Torrent;
 
 #[derive(Debug)]
 pub enum Message {
@@ -142,8 +144,7 @@ pub struct Peer {
     #[serde(default)]
     #[serde(rename = "peer id")]
     pub peer_id: [u8; 20],
-    pub ip: IpAddr,
-    pub port: u16,
+    pub address: SocketAddr,
 }
 
 pub fn deserialize_peers<'de, D>(deserializer: D) -> Result<Vec<Peer>, D::Error>
@@ -173,8 +174,7 @@ where
 
                 peers.push(Peer {
                     peer_id: [0; 20],
-                    ip: IpAddr::V4(Ipv4Addr::new(v[i], v[i + 1], v[i + 2], v[i + 3])),
-                    port,
+                    address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(v[i], v[i + 1], v[i + 2], v[i + 3])), port)
                 })
             }
 
@@ -185,9 +185,17 @@ where
         where
             A: SeqAccess<'de>,
         {
+            #[derive(serde_derive::Deserialize)]
+            struct PeerDict {
+                peer_id: [u8; 20],
+                ip: IpAddr,
+                port: u16
+            };
+
             let mut peers = vec![];
-            while let Some(Peer { peer_id, ip, port }) = seq.next_element()? {
-                peers.push(Peer { peer_id, ip, port })
+            while let Some(PeerDict { peer_id, ip, port }) = seq.next_element()? {
+                let address = SocketAddr::new(ip, port);
+                peers.push(Peer { peer_id,  address})
             }
 
             Ok(peers)
@@ -197,26 +205,58 @@ where
     deserializer.deserialize_any(PeersVisitor)
 }
 
-pub struct Session {
-    conn: TcpStream,
-    peer: Peer,
-    peer_id: String,
-}
-
-impl Session {
-    pub async fn connect(peer_id: String, peer: Peer) -> Result<Self> {
-        info!("connecting to {:?}:{}", peer.ip, peer.port);
-        let conn = match TcpStream::connect((peer.ip, peer.port)).await {
+impl Peer {
+    pub async fn connect(&self, torrent: Arc<Torrent>) -> Result<Session> {
+        info!("connecting to {:?}", self.address);
+        let conn = match TcpStream::connect(self.address).await {
             Ok(conn) => conn,
             Err(e) => return Err(anyhow!(e)),
         };
 
-        Ok(Self {
-            peer,
-            conn,
-            peer_id,
+        Ok(Session {
+            torrent,
+            peer: Peer{
+                peer_id: self.peer_id,
+                address: self.address,
+            },
+            conn
         })
     }
+}
+
+pub struct Session {
+    torrent: Arc<Torrent>,
+    conn: TcpStream,
+    peer: Peer
+}
+
+impl Session {
+    pub async fn run(&mut self) {
+        let info_hash = self.torrent.metainfo.info_hash;
+        if self.handshake(&info_hash).await.is_err() {
+            return;
+        }
+
+        match self.send_message(Message::Interested).await {
+            Ok(_) => {}
+            Err(_) => {
+                return;
+            }
+        };
+
+        loop {
+            let msg = match self.read_message().await {
+                Ok(msg) => msg,
+                Err(_) => {
+                    return;
+                }
+            };
+
+            info!("{:?}", msg);
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        }
+    }
+    
 
     pub async fn handshake(&mut self, info_hash: &[u8]) -> Result<(), anyhow::Error> {
         let mut buf = vec![];
@@ -224,7 +264,7 @@ impl Session {
         buf.extend_from_slice(b"BitTorrent protocol");
         buf.extend_from_slice(&[0; 8]);
         buf.extend_from_slice(&info_hash);
-        buf.extend_from_slice(&self.peer_id.as_bytes());
+        buf.extend_from_slice(&[0; 20]);
         match self.conn.write_all(&buf).await {
             Ok(_) => {}
             Err(e) => {

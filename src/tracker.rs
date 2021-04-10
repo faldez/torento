@@ -68,7 +68,7 @@ const FRAGMENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'_')
     .remove(b'.');
 
-pub async fn announce(url: String, param: Params) -> Result<Response, Error> {
+pub async fn announce(url: &String, param: &Params) -> Result<Response, Error> {
     let query = serde_urlencoded::to_string(&param)?;
     let res = percent_encode(&param.info_hash, FRAGMENT);
     let tracker_url = format!("{}?info_hash={}&{}", url, res.to_string(), query);

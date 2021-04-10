@@ -5,6 +5,8 @@ use anyhow::{anyhow, Result};
 use futures::future::join_all;
 use rand::{distributions::Alphanumeric, Rng};
 use tokio::{fs::File, io::AsyncReadExt, task::JoinHandle};
+use torrent::Torrent;
+use std::sync::Arc;
 
 mod metainfo;
 mod peer;
@@ -28,17 +30,17 @@ async fn main() -> Result<()> {
         return Err(anyhow!(e));
     }
 
-    let torrent = Metainfo::from_bytes(&buffer);
+    let metainfo = Metainfo::from_bytes(&buffer);
 
-    info!("{:?}", torrent.announce);
-    info!("{:?}", torrent.info.name);
-    info!("{:?}", torrent.info.piece_length);
-    info!("{:?}", torrent.info.files);
-    info!("{:?}", torrent.info_hash);
+    info!("{:?}", metainfo.announce);
+    info!("{:?}", metainfo.info.name);
+    info!("{:?}", metainfo.info.piece_length);
+    info!("{:?}", metainfo.info.files);
+    info!("{:?}", metainfo.info_hash);
 
-    let left = if let Some(left) = torrent.info.length {
-        left
-    } else if let Some(files) = torrent.info.files {
+    let left = if let Some(left) = &metainfo.info.length {
+        *left
+    } else if let Some(files) = &metainfo.info.files {
         files.iter().fold(0, |acc, file| acc + file.length)
     } else {
         0
@@ -49,8 +51,9 @@ async fn main() -> Result<()> {
         .take(20)
         .map(char::from)
         .collect();
-    let announce_param = tracker::Params {
-        info_hash: torrent.info_hash,
+
+    let params = tracker::Params {
+        info_hash: metainfo.info_hash,
         peer_id: peer_id.clone(),
         ip: None,
         port: 6881,
@@ -60,43 +63,27 @@ async fn main() -> Result<()> {
         event: None,
         compact: 1,
     };
-    let resp = announce(torrent.announce, announce_param).await.unwrap();
+
+    let mut resp = announce(&metainfo.announce, &params).await.unwrap();
+
+    let torrent = Arc::new(Torrent {
+        metainfo,
+        params
+    });
+
 
     let mut handles: Vec<JoinHandle<()>> = vec![];
-    for peer in resp.peers.iter() {
-        let p = peer.clone();
-        let id = peer_id.clone();
-        let info_hash = torrent.info_hash.clone();
-
+    for peer in resp.peers.drain(..) {
+        let torrent = torrent.clone();
         handles.push(tokio::spawn(async move {
-            let mut session = match peer::Session::connect(id, p.clone()).await {
+            let mut session = match peer.connect(torrent).await {
                 Ok(session) => session,
                 Err(_) => {
                     return;
                 }
             };
 
-            if session.handshake(&info_hash).await.is_err() {
-                return;
-            }
-
-            match session.send_message(peer::Message::Interested).await {
-                Ok(_) => {}
-                Err(_) => {
-                    return;
-                }
-            };
-
-            loop {
-                let msg = match session.read_message().await {
-                    Ok(msg) => msg,
-                    Err(_) => {
-                        return;
-                    }
-                };
-
-                info!("{:?}", msg);
-            }
+            session.run().await;
         }));
     }
 
