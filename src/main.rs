@@ -2,19 +2,16 @@ extern crate pretty_env_logger;
 #[macro_use]
 extern crate log;
 use anyhow::{anyhow, Result};
-use futures::future::join_all;
-use rand::{distributions::Alphanumeric, Rng};
-use tokio::{fs::File, io::AsyncReadExt, task::JoinHandle};
-use torrent::Torrent;
-use std::sync::Arc;
+use tokio::{fs::File, io::AsyncReadExt};
 
 mod metainfo;
 mod peer;
 mod torrent;
 mod tracker;
+mod piece;
+mod writer;
 
 use crate::metainfo::Metainfo;
-use crate::tracker::announce;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -22,72 +19,22 @@ async fn main() -> Result<()> {
 
     let mut buffer = vec![];
     let mut file = File::open(
-        "/Users/fadhlika/Downloads/Bottom-Tier Character Tomozaki [Yen Press] [LuCaZ].torrent",
+        "C:\\Users\\fadhlika\\Downloads\\ubuntu-20.04.2-live-server-amd64.iso.torrent",
+        // "C:\\Users\\fadhlika\\Downloads\\[SubsPlease] 86 - Eighty Six - 01 (1080p) [1B13598F].mkv.torrent"
     )
     .await
     .unwrap();
+    
     if let Err(e) = file.read_to_end(&mut buffer).await {
         return Err(anyhow!(e));
     }
 
     let metainfo = Metainfo::from_bytes(&buffer);
+    let torrent_handle = torrent::start(metainfo).unwrap();
 
-    info!("{:?}", metainfo.announce);
-    info!("{:?}", metainfo.info.name);
-    info!("{:?}", metainfo.info.piece_length);
-    info!("{:?}", metainfo.info.files);
-    info!("{:?}", metainfo.info_hash);
+    let _ = tokio::join!(torrent_handle);
 
-    let left = if let Some(left) = &metainfo.info.length {
-        *left
-    } else if let Some(files) = &metainfo.info.files {
-        files.iter().fold(0, |acc, file| acc + file.length)
-    } else {
-        0
-    };
-
-    let peer_id: String = rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(20)
-        .map(char::from)
-        .collect();
-
-    let params = tracker::Params {
-        info_hash: metainfo.info_hash,
-        peer_id: peer_id.clone(),
-        ip: None,
-        port: 6881,
-        uploaded: 0,
-        downloaded: 0,
-        left,
-        event: None,
-        compact: 1,
-    };
-
-    let mut resp = announce(&metainfo.announce, &params).await.unwrap();
-
-    let torrent = Arc::new(Torrent {
-        metainfo,
-        params
-    });
-
-
-    let mut handles: Vec<JoinHandle<()>> = vec![];
-    for peer in resp.peers.drain(..) {
-        let torrent = torrent.clone();
-        handles.push(tokio::spawn(async move {
-            let mut session = match peer.connect(torrent).await {
-                Ok(session) => session,
-                Err(_) => {
-                    return;
-                }
-            };
-
-            session.run().await;
-        }));
-    }
-
-    join_all(handles).await;
+    tokio::signal::ctrl_c().await?;
 
     Ok(())
 }

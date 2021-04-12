@@ -6,17 +6,11 @@ mod metainfo;
 mod peer;
 mod torrent;
 mod tracker;
+mod piece;
+mod writer;
 
 #[cfg(test)]
 mod tests {
-    use std::{fs::File, io::Read};
-
-    use rand::{Rng, distributions::Alphanumeric};
-
-    use crate::metainfo::Metainfo;
-    use crate::peer;
-    use crate::tracker::{self, announce};
-
     #[test]
     fn load_torrent_file() {
 

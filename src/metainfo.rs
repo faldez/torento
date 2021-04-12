@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
-use serde::{Deserializer, de::{Error, MapAccess, Visitor}};
-use serde_derive::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Deserializer, de::{Error, MapAccess, Visitor}};
 use sha1::{Digest, Sha1};
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -55,7 +54,7 @@ pub struct File {
     pub path: Vec<String>,
 }
 
-#[derive(Debug, serde_derive::Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct Metainfo {
     pub announce: String,
     pub info: Info,
