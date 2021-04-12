@@ -1,1 +1,3 @@
-# torrent
+# torento
+
+bittorrent library written in rust
