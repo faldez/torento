@@ -4,18 +4,15 @@ extern crate log;
 
 mod metainfo;
 mod peer;
+mod piece;
 mod torrent;
 mod tracker;
-mod piece;
 mod writer;
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn load_torrent_file() {
-
-        
-        
         assert!(true);
     }
 }

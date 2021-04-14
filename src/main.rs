@@ -11,8 +11,6 @@ mod tracker;
 mod piece;
 mod writer;
 
-use crate::metainfo::Metainfo;
-
 #[tokio::main]
 async fn main() -> Result<()> {
     pretty_env_logger::init();
@@ -29,7 +27,7 @@ async fn main() -> Result<()> {
         return Err(anyhow!(e));
     }
 
-    let metainfo = Metainfo::from_bytes(&buffer);
+    let metainfo = metainfo::Metainfo::from_bytes(&buffer);
     let torrent_handle = torrent::start(metainfo).unwrap();
 
     let _ = tokio::join!(torrent_handle);

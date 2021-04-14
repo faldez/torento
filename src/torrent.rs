@@ -1,31 +1,27 @@
 use std::{sync::Arc, time::Duration};
 
-use crate::{
-    metainfo::Metainfo,
-    peer::{self, Message, Peer, PeerManager, Session},
-    piece::{Piece, PieceCounter},
-    tracker::{self, Params},
-    writer::WriterHandle,
-};
+use crate::{metainfo::Metainfo, peer::{Message, PeerCommand, PeerManager}, piece::{Piece, PieceCounter}, tracker::{self, Params}, writer};
 use anyhow::{anyhow, Result};
 use async_channel::{Receiver, Sender};
-use bitvec::{bitvec, prelude::Msb0};
-use tokio::fs::metadata;
-use tokio::task::JoinHandle;
-use tracker::Event;
+use bitvec::{
+    bitvec,
+    prelude::{BitVec, Msb0},
+};
+use tokio::{sync::{RwLock, mpsc::{UnboundedReceiver, UnboundedSender}}, task::JoinHandle};
 
 pub struct TorrentContext {
     pub metainfo: Metainfo,
-    pub piece_counter: PieceCounter,
     pub params: Params,
+    pub piece_counter: RwLock<PieceCounter>,
 }
 
 pub struct Torrent {
     pub ctx: Arc<TorrentContext>,
     pub peer_rx: Receiver<Message>,
-    pub cmd_tx: Sender<Message>,
+    pub cmd_tx: Sender<PeerCommand>,
     pub peer_manager: PeerManager,
-    pub writer: WriterHandle,
+    pub writer_handle: JoinHandle<()>,
+    pub writer_tx: UnboundedSender<Piece>,
 }
 
 impl Torrent {
@@ -55,32 +51,31 @@ impl Torrent {
         let total_pieces =
             ((length + (metainfo.info.piece_length - 1)) / metainfo.info.piece_length) as u32;
         let total_pieces = ((total_pieces + 8 - 1) / 8) * 8;
-        info!("total pieces: {}", total_pieces);
-        let piece_counter = PieceCounter {
+                
+        let piece_counter = RwLock::new(PieceCounter {
             total_pieces,
-            downloaded: bitvec![Msb0, u8; 0; total_pieces as usize],
-        };
-
-        let ctx = Arc::new(TorrentContext {
-            metainfo,
-            piece_counter,
-            params,
+            piece_index: bitvec![Msb0, u8; 0; total_pieces as usize],
+            downloaded: vec![vec![false; metainfo.info.piece_length / 16384]; total_pieces as usize],
         });
+
+        let ctx = Arc::new(TorrentContext { metainfo, params, piece_counter });
 
         let (peer_manager, cmd_tx) = PeerManager::new(peer_tx, ctx.clone());
 
-        let writer = WriterHandle::start(ctx.clone());
+        let (writer_handle, writer_tx) = writer::start(ctx.clone());
 
         Self {
             ctx,
             peer_rx,
             cmd_tx,
             peer_manager,
-            writer,
+            writer_handle,
+            writer_tx,
         }
     }
     pub async fn run(&mut self) {
-        let resp = tracker::announce(self.ctx.clone()).await.unwrap();
+        let mut resp = tracker::announce(self.ctx.clone()).await.unwrap();
+        info!("announce interval in {}s", resp.interval.unwrap_or(100));
 
         self.peer_manager.connect_peers(resp.peers);
 
@@ -88,17 +83,25 @@ impl Torrent {
         let mut blocks = vec![false; n];
 
         let mut now = std::time::Instant::now();
-        
+        let mut now_announce = std::time::Instant::now();
+
+        let mut piece_index = 0_u32;
+
         loop {
-            let piece_index = match self.ctx.piece_counter.downloaded.iter_zeros().next() {
+            piece_index = match self.ctx.piece_counter.read().await.piece_index.iter_zeros().next() {
                 Some(index) => {
+                    if piece_index != index as u32 {
+                        blocks = vec![false; n];
+                    }
+
                     index as u32
-                }
+                },
                 None => {
+                    info!("all piece downlaoded");
+                    self.peer_manager.shutdown();
                     return;
                 }
             };
-            
 
             if let Ok(msg) = self.peer_rx.recv().await {
                 match msg {
@@ -110,14 +113,12 @@ impl Torrent {
                     Message::Bitfield(_) => {}
                     Message::Request(_, _, _) => {}
                     Message::Piece(index, begin, piece) => {
-                        if !blocks[begin as usize / 16384] {
-                            let piece = Piece {
+                        if !self.ctx.piece_counter.read().await.downloaded[index as usize][begin as usize / 16384] && index == piece_index {
+                            self.writer_tx.send(Piece {
                                 index: index as usize,
                                 begin: begin as usize,
                                 piece,
-                            };
-                            self.writer.send(piece);
-                            blocks[begin as usize / 16384] = true;
+                            }).unwrap();
                         }
                     }
                     Message::Cancel(_, _, _) => {}
@@ -127,15 +128,15 @@ impl Torrent {
             }
 
             if std::time::Instant::now().saturating_duration_since(now)
-                > std::time::Duration::from_secs(1)
+                > std::time::Duration::from_secs(15)
             {
                 for i in 0..n {
-                    if blocks[i] {
+                    if self.ctx.piece_counter.read().await.downloaded[piece_index as usize][i] {
                         continue;
                     }
 
                     self.cmd_tx
-                        .send(Message::Request(piece_index, (i * 16384) as u32, 16384))
+                        .send(PeerCommand::Message(Message::Request(piece_index, (i * 16384) as u32, 16384)))
                         .await
                         .unwrap();
                 }
@@ -143,7 +144,15 @@ impl Torrent {
                 now = std::time::Instant::now();
             }
 
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            if std::time::Instant::now().saturating_duration_since(now_announce)
+                > std::time::Duration::from_secs(resp.interval.unwrap_or(60))
+            {
+                resp = tracker::announce(self.ctx.clone()).await.unwrap();
+
+                self.peer_manager.connect_peers(resp.peers);
+
+                now_announce = std::time::Instant::now();
+            }
         }
     }
 }
