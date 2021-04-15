@@ -11,7 +11,6 @@ pub struct Writer {
     ctx: Arc<TorrentContext>,
     writer_rx: UnboundedReceiver<Piece>,
     files: Vec<File>,
-    buffer: Vec<u8>,
 }
 
 impl Writer {
@@ -23,7 +22,6 @@ impl Writer {
             ctx,
             writer_rx,
             files,
-            buffer,
         }
     }
 
@@ -50,8 +48,6 @@ impl Writer {
 
         loop {
             if let Some(piece) = self.writer_rx.recv().await {
-                self.buffer
-                    .splice(piece.begin..piece.begin + piece.piece.len(), piece.piece);
                 self.ctx.piece_counter.write().await.downloaded[piece.index][piece.begin / 16384] =
                     true;
 
@@ -60,7 +56,7 @@ impl Writer {
                     .seek(SeekFrom::Start(offset as u64))
                     .await
                     .unwrap();
-                self.files[0].write_all(&self.buffer).await.unwrap();
+                self.files[0].write_all(&piece.piece).await.unwrap();
 
                 if self.ctx.piece_counter.read().await.downloaded[piece.index]
                 .iter()
