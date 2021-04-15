@@ -1,8 +1,4 @@
 use crate::{piece::Piece, torrent::TorrentContext};
-use anyhow::Result;
-use async_channel::Sender;
-use bitvec::{order::Msb0, prelude::BitVec};
-use std::io::Write;
 use std::{io::SeekFrom, sync::Arc};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
@@ -16,22 +12,18 @@ pub struct Writer {
     writer_rx: UnboundedReceiver<Piece>,
     files: Vec<File>,
     buffer: Vec<u8>,
-    blocks: Vec<bool>,
 }
 
 impl Writer {
     pub fn new(ctx: Arc<TorrentContext>, writer_rx: UnboundedReceiver<Piece>) -> Self {
         let files = vec![];
-
         let buffer = vec![0; ctx.metainfo.info.piece_length];
-        let blocks = vec![false; ctx.metainfo.info.piece_length / 16384];
 
         Self {
             ctx,
             writer_rx,
             files,
             buffer,
-            blocks,
         }
     }
 
@@ -54,6 +46,7 @@ impl Writer {
                 .unwrap();
             self.files.push(file);
         }
+        info!("Created file with {} pieces. Piece length {}", self.ctx.piece_counter.read().await.piece_index.len(), self.ctx.metainfo.info.piece_length);
 
         loop {
             if let Some(piece) = self.writer_rx.recv().await {
@@ -69,20 +62,20 @@ impl Writer {
                     .unwrap();
                 self.files[0].write_all(&self.buffer).await.unwrap();
 
-                info!("write piece {} to file at {}", piece.index, offset);
                 if self.ctx.piece_counter.read().await.downloaded[piece.index]
-                    .iter()
-                    .find(|p| **p == false)
-                    .is_none()
+                .iter()
+                .find(|p| **p == false)
+                .is_none()
                 {
                     self.ctx
-                        .piece_counter
-                        .write()
-                        .await
-                        .piece_index
-                        .set(piece.index, true);
+                    .piece_counter
+                    .write()
+                    .await
+                    .piece_index
+                    .set(piece.index, true);
                     info!("piece {}/{} done", piece.index, self.ctx.piece_counter.read().await.total_pieces);
                 }
+                info!("write piece {} to file at {}", piece.index, offset);
             }
         }
     }

@@ -1,30 +1,14 @@
 use anyhow::{anyhow, Result};
 use async_channel::{Receiver, Sender};
-use bitvec::{bitvec, order::Msb0, prelude::BitVec, view::BitView};
-use linked_hash_set::LinkedHashSet;
-use serde::{
-    de::{Error, SeqAccess, Visitor},
-    Deserializer,
-};
-use std::{
-    borrow::BorrowMut,
-    collections::HashMap,
-    convert::TryInto,
-    mem::size_of,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
-};
+use bitvec::{order::Msb0, prelude::BitVec};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    task::JoinHandle,
 };
-use tokio::{net::TcpListener, task::JoinHandle};
 
-use crate::{
-    metainfo::{self, Metainfo},
-    piece::{Block, Piece},
-    torrent::{Torrent, TorrentContext},
-};
+use crate::torrent::TorrentContext;
 
 #[derive(Debug)]
 pub enum Message {
@@ -39,6 +23,46 @@ pub enum Message {
     Cancel(u32, u32, u32),
     KeepAlive,
     Invalid,
+}
+
+impl std::fmt::Display for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Message::Choke => {
+                write!(f, "Choke")
+            }
+            Message::Unchoke => {
+                write!(f, "Unchoke")
+            }
+            Message::Interested => {
+                write!(f, "Interested")
+            }
+            Message::NotInterested => {
+                write!(f, "NotInterested")
+            }
+            Message::Have(index) => {
+                write!(f, "Have({})", index)
+            }
+            Message::Bitfield(_) => {
+                write!(f, "Bitfield")
+            }
+            Message::Request(index, begin, length) => {
+                write!(f, "Request({}, {}, {})", index, begin, length)
+            }
+            Message::Piece(index, begin, piece) => {
+                write!(f, "Piece({}, {}, [{}])", index, begin, piece.len())
+            }
+            Message::Cancel(index, begin, length) => {
+                write!(f, "Cancel({}, {}, {})", index, begin, length)
+            }
+            Message::KeepAlive => {
+                write!(f, "KeepAlive")
+            }
+            Message::Invalid => {
+                write!(f, "Invalid")
+            }
+        }
+    }
 }
 
 impl From<Vec<u8>> for Message {
@@ -163,8 +187,15 @@ impl Into<Vec<u8>> for Message {
     }
 }
 
+pub enum AlertMessage {
+    Received(SocketAddr, Message),
+    Connecting(SocketAddr),
+    Connected(SocketAddr),
+    Quit(SocketAddr),
+}
+
 pub enum PeerCommand {
-    Message(Message),
+    Send(Message),
     Shutdown,
 }
 
@@ -173,17 +204,18 @@ pub struct Peer {
     pub address: SocketAddr,
     ctx: Arc<TorrentContext>,
     conn: Option<TcpStream>,
-    peer_tx: Sender<Message>,
+    peer_tx: Sender<AlertMessage>,
     cmd_rx: Receiver<PeerCommand>,
+    bitfield: BitVec<Msb0, u8>,
     choke: bool,
-    outgoing_requests: LinkedHashSet<Block>,
+    ready: bool,
 }
 
 impl Peer {
     pub fn new(
         ctx: Arc<TorrentContext>,
         address: SocketAddr,
-        peer_tx: Sender<Message>,
+        peer_tx: Sender<AlertMessage>,
         cmd_rx: Receiver<PeerCommand>,
     ) -> Self {
         Self {
@@ -193,89 +225,61 @@ impl Peer {
             peer_tx,
             cmd_rx,
             ctx,
+            bitfield: BitVec::new(),
             choke: false,
-            outgoing_requests: LinkedHashSet::new(),
+            ready: true,
         }
     }
 
-    pub async fn run(&mut self) -> Result<()> {
-        loop {
-            // if there is no connection, try connecting
-            if self.conn.is_none() {
-                let conn = match TcpStream::connect(self.address).await {
-                    Ok(conn) => conn,
-                    Err(e) => {
-                        error!("connect {}", e);
-                        tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
-                        return Err(anyhow!(e));
-                    }
-                };
-                info!("connected to {:?}", self.address);
-
-                self.conn = Some(conn);
-
-                let info_hash = self.ctx.metainfo.info_hash;
-
-                // if there is error while handshaking, disconnect and try again
-                if let Err(e) = self.handshake(&info_hash).await {
-                    error!("handsake {}", e);
-                    self.conn = None;
-                    tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
-                    return Err(anyhow!(e));
-                }
-
-                // if there is error while send message Interested, disconnect and try again
-                match self.send_message(Message::Interested).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!("interested {}", e);
-                        self.conn = None;
-                        tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
-                        return Err(anyhow!(e));
-                    }
-                };
+    pub async fn initiate_outgoing_connection(&mut self) -> Result<()> {
+        self.conn = match TcpStream::connect(self.address).await {
+            Ok(conn) => Some(conn),
+            Err(e) => {
+                return Err(anyhow!("{} > connection: {}", self.address, e));
             }
+        };
 
+        let info_hash = self.ctx.metainfo.info_hash;
+
+        // if there is error while handshaking, disconnect and try again
+        if let Err(e) = self.handshake(&info_hash).await {
+            return Err(anyhow!("{} > handshake: {}", self.address, e));
+        }
+
+        // if there is error while send message Interested, disconnect and try again
+        if let Err(e) = self.send_message(Message::Interested).await {
+            return Err(anyhow!("{} > interested: {}", self.address, e));
+        };
+
+        Ok(())
+    }
+
+    pub async fn run(&mut self) -> Result<()> {
+        self.peer_tx
+            .send(AlertMessage::Connecting(self.address))
+            .await
+            .unwrap();
+
+        // if there is no connection, try connecting
+        if let Err(e) = self.initiate_outgoing_connection().await {
+            self.peer_tx
+                .send(AlertMessage::Quit(self.address))
+                .await
+                .unwrap();
+            return Err(e);
+        }
+
+        self.peer_tx
+            .send(AlertMessage::Connected(self.address))
+            .await
+            .unwrap();
+
+        loop {
             if let Ok(cmd) = self.cmd_rx.try_recv() {
                 match cmd {
-                    PeerCommand::Message(msg) => match msg {
-                        Message::Request(index, begin, length) => {
-                            if !self.choke {
-                                self.outgoing_requests.insert(Block {
-                                    index,
-                                    begin,
-                                    length,
-                                });
-                            }
-                        }
-                        _ => {}
-                    },
+                    PeerCommand::Send(_) => {}
                     PeerCommand::Shutdown => {
                         return Ok(());
-                    }
-                }
-            }
-
-            // pop outgoing request from front
-            // send request message if there is request queue
-            if let Some(req) = self.outgoing_requests.pop_front() {
-                // check if block downloaded, don't request if downloaded
-                if !self.ctx.piece_counter.read().await.downloaded[req.index as usize]
-                    [req.begin as usize / 16384]
-                {
-                    // send request message
-                    info!("{:?} > {:?}", self.address, req);
-                    match self
-                        .send_message(Message::Request(req.index, req.begin, req.length))
-                        .await
-                    {
-                        Ok(_) => {}
-                        Err(e) => {
-                            // disconnect if send message failed
-                            error!("{}", e);
-                            self.conn = None;
-                            return Err(anyhow!(e));
-                        }
                     }
                 }
             }
@@ -283,28 +287,77 @@ impl Peer {
             let msg = match self.read_message().await {
                 Ok(msg) => msg,
                 Err(e) => {
-                    // disconnect from peer if read_message return error
-                    // so we can retry connecting
-                    error!("{}", e);
-                    self.conn = None;
-                    tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
-                    return Err(anyhow!(e));
+                    // quit from peer if read_message return error
+                    return Err(e);
                 }
             };
 
-            match &msg {
-                Message::Choke => {
-                    self.choke = true;
-                }
-                Message::Unchoke => {
-                    self.choke = false;
-                }
-                _ => {
-                    self.peer_tx.send(msg).await.unwrap();
+            if let Some(msg) = msg {
+                info!("{} > Receive: {}", self.address, msg);
+
+                match &msg {
+                    Message::Choke => {
+                        self.choke = true;
+                    }
+                    Message::Unchoke => {
+                        self.choke = false;
+                        self.ready = true;
+                    }
+                    Message::Bitfield(index) => {
+                        self.bitfield.clone_from(index);
+                    }
+                    Message::Have(index) => {
+                        self.bitfield.set(*index as usize, true);
+                    }
+                    _ => {
+                        self.peer_tx
+                            .send(AlertMessage::Received(self.address, msg))
+                            .await
+                            .unwrap();
+                        self.ready = true;
+                    }
                 }
             }
 
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            // pop outgoing request from front
+            // send request message if there is request queue
+            if !self.choke && self.ready {
+                let block = {
+                    let mut outgoing_requests = self.ctx.outgoing_requests.write().await;
+                    let req = outgoing_requests.front();
+                    if let Some(req) = req {
+                        if let Some(val) = self.bitfield.get(req.index as usize).as_deref() {
+                            if *val {
+                                outgoing_requests.pop_front()
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(req) = block {
+                    if !self.ctx.piece_counter.read().await.downloaded[req.index as usize]
+                        [req.begin as usize / 16384]
+                    {
+                        // send request message
+                        info!("{:?} > Send {:?}", self.address, req);
+                        if let Err(e) = self
+                            .send_message(Message::Request(req.index, req.begin, req.length))
+                            .await
+                        {
+                            return Err(anyhow!(e));
+                        }
+                        self.ready = false;
+                    }
+                }
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
     }
 
@@ -326,25 +379,11 @@ impl Peer {
             }
 
             let mut reply = [0; 68];
-            let mut i = 0;
-            loop {
-                // Wait for the socket to be readable
-                conn.readable().await?;
-
-                // Try to read data, this may still fail with `WouldBlock`
-                // if the readiness event is a false positive.
-                match conn.try_read(&mut reply[i..]) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        i += n;
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        continue;
-                    }
-                    Err(e) => {
-                        self.conn = None;
-                        return Err(e.into());
-                    }
+            match conn.read_exact(&mut reply).await {
+                Ok(_) => {}
+                Err(e) => {
+                    error!("failed to read handshake message {}", e);
+                    return Err(anyhow::anyhow!(e));
                 }
             }
 
@@ -370,37 +409,51 @@ impl Peer {
         }
     }
 
-    pub async fn read_message(&mut self) -> Result<Message> {
+    pub async fn read_message(&mut self) -> Result<Option<Message>> {
         if let Some(conn) = self.conn.as_mut() {
             let mut len_prefix = [0; 4];
-            match conn.read(&mut len_prefix).await {
-                Ok(_) => {}
-                Err(e) => {
-                    error!("failed to read length message {}", e);
-                    return Err(anyhow::anyhow!(e));
+            match tokio::time::timeout(std::time::Duration::from_secs(1), conn.read_exact(&mut len_prefix)).await {
+                Ok(res) => {
+                    match res {
+                        Ok(_) => {}
+                        Err(e) => {
+                            error!("failed to read length message {}", e);
+                            return Err(anyhow::anyhow!(e));
+                        }
+                    }
+                }
+                Err(_) => {
+                    return Ok(None);
                 }
             }
 
             let length = u32::from_be_bytes(len_prefix);
 
             let mut message = vec![0; length as usize];
-            match conn.read_exact(&mut message).await {
-                Ok(_) => {}
-                Err(e) => {
-                    error!("failed to read payload message {}", e);
-                    return Err(anyhow::anyhow!(e));
+            match tokio::time::timeout(std::time::Duration::from_secs(1), conn.read_exact(&mut message)).await {
+                Ok(res) => {
+                    match res {
+                        Ok(_) => {}
+                        Err(e) => {
+                            error!("failed to read message {}", e);
+                            return Err(anyhow::anyhow!(e));
+                        }
+                    }
+                }
+                Err(_) => {
+                    return Ok(None);
                 }
             }
 
-            Ok(message.into())
+            Ok(Some(message.into()))
         } else {
             Err(anyhow!("{} > Connection not exist", self.address))
         }
     }
 
-    pub async fn send_message(&mut self, message_type: Message) -> Result<()> {
+    pub async fn send_message(&mut self, message: Message) -> Result<()> {
         if let Some(conn) = self.conn.as_mut() {
-            let payload: Vec<u8> = message_type.into();
+            let payload: Vec<u8> = message.into();
             match conn.write_all(&payload).await {
                 Ok(_) => {}
                 Err(e) => {
@@ -432,27 +485,46 @@ impl Session {
 
 pub struct PeerManager {
     pub ctx: Arc<TorrentContext>,
-    pub peer_tx: Sender<Message>,
+    pub peer_tx: Sender<AlertMessage>,
     pub cmd_rx: Receiver<PeerCommand>,
+    pub available_peers: Vec<SocketAddr>,
     pub peers: HashMap<SocketAddr, Session>,
 }
 
 impl PeerManager {
-    pub fn new(peer_tx: Sender<Message>, ctx: Arc<TorrentContext>) -> (Self, Sender<PeerCommand>) {
+    pub fn new(
+        peer_tx: Sender<AlertMessage>,
+        ctx: Arc<TorrentContext>,
+    ) -> (Self, Sender<PeerCommand>) {
         let (cmd_tx, cmd_rx) = async_channel::unbounded();
         (
             Self {
                 ctx,
                 peer_tx,
                 cmd_rx,
+                available_peers: Vec::new(),
                 peers: HashMap::new(),
             },
             cmd_tx,
         )
     }
 
-    pub fn connect_peers(&mut self, mut address: Vec<SocketAddr>) {
-        for addr in address.drain(..10) {
+    pub fn set_available_peers(&mut self, address: Vec<SocketAddr>) {
+        self.available_peers = address;
+    }
+
+    pub fn connect_peers(&mut self) {
+        let max_connection = if self.available_peers.len() > 5 {
+            5
+        } else {
+            self.available_peers.len()
+        };
+
+        if self.peers.len() > max_connection {
+            return;
+        }
+
+        for addr in self.available_peers.drain(..max_connection) {
             let peer = Peer::new(
                 self.ctx.clone(),
                 addr,
@@ -463,7 +535,7 @@ impl PeerManager {
         }
     }
 
-    pub fn shutdown(&mut self) {
-        self.peers.clear();
+    pub fn shutdown_peer(&mut self, peer: SocketAddr) {
+        self.peers.remove(&peer);
     }
 }

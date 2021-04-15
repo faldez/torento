@@ -1,6 +1,6 @@
 use bitvec::prelude::*;
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct Block {
     pub index: u32,
     pub begin: u32,

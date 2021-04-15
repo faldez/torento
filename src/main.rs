@@ -15,11 +15,13 @@ mod writer;
 async fn main() -> Result<()> {
     pretty_env_logger::init();
 
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() != 2 {
+        return Err(anyhow!("Path to torrent file is necessary"));
+    }
+
     let mut buffer = vec![];
-    let mut file = File::open(
-        "C:\\Users\\fadhlika\\Downloads\\ubuntu-20.04.2-live-server-amd64.iso.torrent",
-        // "C:\\Users\\fadhlika\\Downloads\\[SubsPlease] 86 - Eighty Six - 01 (1080p) [1B13598F].mkv.torrent"
-    )
+    let mut file = File::open(&args[1])
     .await
     .unwrap();
     
